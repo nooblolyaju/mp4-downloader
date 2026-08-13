@@ -60,7 +60,7 @@ function removeDir(dir) {
   } catch (_) {}
 }
 
-// フォーマット抽出
+// フォーマット抽出（サムネイル対応）
 async function extractFormats(pageUrl) {
   const viewkey = getViewkey(pageUrl);
   if (!viewkey) throw new Error('viewkey が見つかりません');
@@ -80,16 +80,20 @@ async function extractFormats(pageUrl) {
 
   let mediaDefinitions = null;
   let title = 'video';
+  let thumbnail = null;
 
+  // flashvars から取得
   const fvMatch = html.match(/var\s+flashvars_\d+\s*=\s*(\{[\s\S]*?\});/);
   if (fvMatch) {
     try {
       const fv = JSON.parse(fvMatch[1]);
       if (Array.isArray(fv.mediaDefinitions)) mediaDefinitions = fv.mediaDefinitions;
       if (fv.video_title) title = fv.video_title;
+      if (fv.image_url) thumbnail = fv.image_url;
     } catch (_) {}
   }
 
+  // mediaDefinitions 別パターン
   if (!mediaDefinitions) {
     const m = html.match(/"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
     if (m) {
@@ -97,6 +101,15 @@ async function extractFormats(pageUrl) {
     }
   }
 
+  // image_url フォールバック
+  if (!thumbnail) {
+    const imgMatch = html.match(/"image_url"\s*:\s*"([^"]+)"/);
+    if (imgMatch) {
+      thumbnail = imgMatch[1];
+    }
+  }
+
+  // APIフォールバック
   if (!mediaDefinitions) {
     try {
       const apiRes = await fetch('https://www.pornhub.com/video/get_media_definitions_v2', {
@@ -119,11 +132,17 @@ async function extractFormats(pageUrl) {
     throw new Error('動画情報を抽出できませんでした');
   }
 
+  // タイトルフォールバック
   if (title === 'video') {
     const t = html.match(/<title[^>]*>([^<]+)<\/title>/i);
     if (t) {
       title = t[1].replace(/\s*-\s*PornHub.*$/i, '').replace(/\s*\|.*$/i, '').trim() || 'video';
     }
+  }
+
+  // エスケープされたスラッシュを戻す
+  if (thumbnail) {
+    thumbnail = thumbnail.replace(/\\\//g, '/');
   }
 
   const formats = mediaDefinitions
@@ -144,6 +163,7 @@ async function extractFormats(pageUrl) {
     .filter(f => f.height > 0)
     .sort((a, b) => b.height - a.height);
 
+  // 重複除去
   const seen = new Set();
   const unique = formats.filter(f => {
     if (seen.has(f.url)) return false;
@@ -152,16 +172,20 @@ async function extractFormats(pageUrl) {
   });
 
   if (!unique.length) throw new Error('利用可能なフォーマットがありません');
-  return { title, formats: unique };
+
+  return {
+    title,
+    thumbnail,
+    formats: unique,
+  };
 }
 
-// m3u8の中身を取得してセグメントURLリストを返す
+// m3u8からセグメントURLリストを取得
 async function getSegmentUrls(m3u8Url, referer) {
   const res = await fetch(m3u8Url, { headers: getHeaders(referer) });
   if (!res.ok) throw new Error('m3u8の取得に失敗しました');
   const text = await res.text();
 
-  // マスタープレイリストなら一番高い帯域を選択
   if (text.includes('#EXT-X-STREAM-INF')) {
     const lines = text.split('\n');
     let bestUrl = null;
@@ -192,7 +216,7 @@ async function getSegmentUrls(m3u8Url, referer) {
   return segments;
 }
 
-// セグメントをダウンロードしてローカルに保存
+// セグメントをローカルにダウンロード
 async function downloadSegments(segmentUrls, tempDir, referer) {
   const localFiles = [];
 
@@ -222,10 +246,9 @@ async function downloadSegments(segmentUrls, tempDir, referer) {
   return localFiles;
 }
 
-// ローカルのtsファイルをffmpegでMP4に変換
+// ローカルtsをMP4に変換
 function convertLocalTsToMp4(localFiles, outputPath) {
   return new Promise((resolve, reject) => {
-    // concat用のリストファイルを作成
     const listPath = path.join(path.dirname(outputPath), 'concat.txt');
     const listContent = localFiles.map(f => `file '${f.replace(/\\/g, '/')}'`).join('\n');
     fs.writeFileSync(listPath, listContent);
@@ -250,7 +273,6 @@ function convertLocalTsToMp4(localFiles, outputPath) {
       if (code === 0 && fs.existsSync(outputPath)) {
         resolve();
       } else {
-        // エラーの最後の部分だけ返す
         const last = stderr.split('\n').slice(-8).join('\n');
         reject(new Error('ffmpeg変換に失敗しました\n' + last));
       }
