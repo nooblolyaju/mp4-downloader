@@ -33,89 +33,175 @@ function isPornhubUrl(url) {
   }
 }
 
-// ページからフォーマット情報を抽出
+// viewkey を取り出す
+function getViewkey(url) {
+  try {
+    const u = new URL(url);
+    return u.searchParams.get('viewkey') || null;
+  } catch {
+    return null;
+  }
+}
+
+// 共通ヘッダー
+function getHeaders(referer = 'https://www.pornhub.com/') {
+  return {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    'Referer': referer,
+    'Origin': 'https://www.pornhub.com',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Upgrade-Insecure-Requests': '1',
+  };
+}
+
+// ページからフォーマット情報を抽出（強化版）
 async function extractFormats(pageUrl) {
+  const viewkey = getViewkey(pageUrl);
+  if (!viewkey) {
+    throw new Error('viewkey が見つかりません。正しい動画ページのURLを入力してください。');
+  }
+
+  // 1. まずページを取得
   const res = await fetch(pageUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-      'Referer': 'https://www.pornhub.com/',
-    },
-    timeout: 20000,
+    headers: getHeaders(pageUrl),
+    redirect: 'follow',
+    timeout: 25000,
   });
 
-  if (!res.ok) throw new Error(`ページの取得に失敗しました (${res.status})`);
+  if (!res.ok) {
+    throw new Error(`ページの取得に失敗しました (${res.status})`);
+  }
+
   const html = await res.text();
 
-  let mediaDefinitions = null;
+  // 年齢確認やブロックページの簡易チェック
+  if (html.includes('geoBlocked') || html.includes('This content is unavailable in your country')) {
+    throw new Error('この動画は地域制限により視聴できません（サーバーの所在地の問題）');
+  }
 
-  // パターン1: mediaDefinitions 直接
-  const m1 = html.match(/mediaDefinitions\s*[:=]\s*(\[[\s\S]*?\])\s*[,;]/);
-  if (m1) {
+  let mediaDefinitions = null;
+  let title = 'video';
+
+  // --- 抽出パターンを複数試す ---
+
+  // パターンA: var flashvars_123456 = {...};
+  const flashvarsMatch = html.match(/var\s+flashvars_\d+\s*=\s*(\{[\s\S]*?\});/);
+  if (flashvarsMatch) {
     try {
-      mediaDefinitions = JSON.parse(m1[1]);
+      const fv = JSON.parse(flashvarsMatch[1]);
+      if (Array.isArray(fv.mediaDefinitions)) {
+        mediaDefinitions = fv.mediaDefinitions;
+      }
+      if (fv.video_title) title = fv.video_title;
     } catch (_) {}
   }
 
-  // パターン2: flashvars
+  // パターンB: "mediaDefinitions": [...]
   if (!mediaDefinitions) {
-    const m2 = html.match(/flashvars\s*=\s*({[\s\S]*?});/);
-    if (m2) {
+    const m = html.match(/"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
+    if (m) {
       try {
-        const fv = JSON.parse(m2[1]);
-        mediaDefinitions = fv.mediaDefinitions;
+        mediaDefinitions = JSON.parse(m[1]);
       } catch (_) {}
     }
   }
 
-  // パターン3: 別の書き方
+  // パターンC: mediaDefinitions = [...]
   if (!mediaDefinitions) {
-    const m3 = html.match(/"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])/);
-    if (m3) {
+    const m = html.match(/mediaDefinitions\s*[:=]\s*(\[[\s\S]*?\])\s*[,;]/);
+    if (m) {
       try {
-        mediaDefinitions = JSON.parse(m3[1]);
+        mediaDefinitions = JSON.parse(m[1]);
       } catch (_) {}
     }
   }
 
-  if (!mediaDefinitions || !Array.isArray(mediaDefinitions)) {
-    throw new Error('動画情報を抽出できませんでした。URLが正しいか確認してください。');
+  // パターンD: APIフォールバック
+  if (!mediaDefinitions) {
+    try {
+      const apiRes = await fetch('https://www.pornhub.com/video/get_media_definitions_v2', {
+        method: 'POST',
+        headers: {
+          ...getHeaders(pageUrl),
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: new URLSearchParams({
+          id: viewkey,
+          viewkey: viewkey,
+        }).toString(),
+      });
+
+      if (apiRes.ok) {
+        const apiData = await apiRes.json();
+        if (Array.isArray(apiData) && apiData.length > 0) {
+          mediaDefinitions = apiData;
+        }
+      }
+    } catch (_) {}
   }
 
+  if (!mediaDefinitions || !Array.isArray(mediaDefinitions) || mediaDefinitions.length === 0) {
+    throw new Error('動画情報を抽出できませんでした。URLが正しいか、動画が公開されているか確認してください。');
+  }
+
+  // タイトルが取れなかった場合のフォールバック
+  if (title === 'video') {
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    if (titleMatch) {
+      title = titleMatch[1]
+        .replace(/\s*-\s*PornHub.*$/i, '')
+        .replace(/\s*\|.*$/i, '')
+        .trim() || 'video';
+    }
+  }
+
+  // フォーマット整形
   const formats = mediaDefinitions
     .filter(d => d && d.videoUrl)
-    .map(d => ({
-      quality: d.quality || d.height || 'unknown',
-      height: parseInt(d.quality || d.height) || 0,
-      url: d.videoUrl,
-      isHls: (d.format === 'hls') || String(d.videoUrl).includes('.m3u8'),
-    }))
+    .map(d => {
+      let height = 0;
+      if (typeof d.quality === 'number') {
+        height = d.quality;
+      } else if (typeof d.quality === 'string') {
+        height = parseInt(d.quality) || 0;
+      } else if (Array.isArray(d.quality)) {
+        height = Math.max(...d.quality.map(q => parseInt(q) || 0));
+      }
+
+      return {
+        quality: height || d.quality || 'unknown',
+        height,
+        url: d.videoUrl,
+        isHls: (d.format === 'hls') || String(d.videoUrl).includes('.m3u8'),
+      };
+    })
+    .filter(f => f.url)
     .sort((a, b) => b.height - a.height);
 
-  if (!formats.length) {
+  // 重複除去
+  const seen = new Set();
+  const uniqueFormats = formats.filter(f => {
+    if (seen.has(f.url)) return false;
+    seen.add(f.url);
+    return true;
+  });
+
+  if (!uniqueFormats.length) {
     throw new Error('利用可能なフォーマットが見つかりませんでした');
   }
 
-  // タイトル取得
-  let title = 'video';
-  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-  if (titleMatch) {
-    title = titleMatch[1]
-      .replace(/\s*-\s*PornHub.*$/i, '')
-      .replace(/\s*\|.*$/i, '')
-      .trim() || 'video';
-  }
-
-  return { title, formats };
+  return { title, formats: uniqueFormats };
 }
 
 // m3u8 からセグメント一覧を取得
-async function getSegments(m3u8Url) {
+async function getSegments(m3u8Url, referer) {
   const res = await fetch(m3u8Url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Referer': 'https://www.pornhub.com/',
-    },
+    headers: getHeaders(referer),
   });
 
   if (!res.ok) throw new Error('m3u8の取得に失敗しました');
@@ -137,7 +223,7 @@ async function getSegments(m3u8Url) {
         }
       }
     }
-    if (bestUrl) return getSegments(bestUrl);
+    if (bestUrl) return getSegments(bestUrl, referer);
   }
 
   const segments = [];
@@ -182,18 +268,15 @@ app.post('/api/download', checkKey, async (req, res) => {
     const filename = `${safeTitle}_${selected.quality || selected.height}p.mp4`;
 
     if (selected.isHls) {
-      const segments = await getSegments(selected.url);
+      const segments = await getSegments(selected.url, url);
       if (!segments.length) throw new Error('セグメントが取得できませんでした');
 
       res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
 
       for (const segUrl of segments) {
         const segRes = await fetch(segUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': url,
-          },
+          headers: getHeaders(url),
         });
         if (!segRes.ok) continue;
         await pipeline(segRes.body, res, { end: false });
@@ -201,16 +284,13 @@ app.post('/api/download', checkKey, async (req, res) => {
       res.end();
     } else {
       const videoRes = await fetch(selected.url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Referer': url,
-        },
+        headers: getHeaders(url),
       });
 
       if (!videoRes.ok) throw new Error('動画の取得に失敗しました');
 
       res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
       await pipeline(videoRes.body, res);
     }
   } catch (err) {
