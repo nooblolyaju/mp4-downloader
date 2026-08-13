@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PornHub Downloader</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>PornHub Downloader</h1>
+    <p class="subtitle">URLを貼るだけでダウンロード（どのブラウザでもOK）</p>
+
+    <div class="card">
+      <label for="url">動画ページのURL</label>
+      <input type="url" id="url" placeholder="https://www.pornhub.com/view_video.php?viewkey=..." />
+
+      <label for="key">APIキー</label>
+      <input type="password" id="key" placeholder="自分で設定したキー" />
+
+      <div class="row">
+        <button id="infoBtn">情報を取得</button>
+        <button id="dlBtn" class="primary">ダウンロード</button>
+      </div>
+
+      <div id="status" class="status"></div>
+      <div id="formats" class="formats"></div>
+    </div>
+
+    <p class="note">※ 自分のサーバーで動作しています。利用は自己責任でお願いします。</p>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
