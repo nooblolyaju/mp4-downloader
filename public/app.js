@@ -85,27 +85,58 @@ dlBtn.addEventListener('click', async () => {
       throw new Error(err.error || `エラー ${res.status}`);
     }
 
-    const blob = await res.blob();
+    // ファイル名を取得（必ず.mp4にする）
     const disp = res.headers.get('Content-Disposition') || '';
     const match = disp.match(/filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i);
     let filename = 'video.mp4';
-    if (match) filename = decodeURIComponent(match[1] || match[2] || 'video.mp4');
+    if (match) {
+      filename = decodeURIComponent(match[1] || match[2] || 'video.mp4');
+    }
+    // 拡張子がなければ強制的に.mp4を付ける
+    if (!filename.toLowerCase().endsWith('.mp4')) {
+      filename += '.mp4';
+    }
 
-    const blobUrl = URL.createObjectURL(blob);
+    const blob = await res.blob();
+    // MIMEタイプを明示的にvideo/mp4にする
+    const mp4Blob = new Blob([blob], { type: 'video/mp4' });
+    const blobUrl = URL.createObjectURL(mp4Blob);
 
     if (isIOS()) {
-      setStatus('新しいタブで開きます。長押しして「ファイルに保存」を選んでください', 'ok');
-      setTimeout(() => {
-        const opened = window.open(blobUrl, '_blank');
-        if (!opened) {
-          const a = document.createElement('a');
-          a.href = blobUrl;
-          a.target = '_blank';
-          a.click();
+      // iOS向け：共有シートを優先（ファイル名が付きやすい）
+      const file = new File([mp4Blob], filename, { type: 'video/mp4' });
+
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({
+            files: [file],
+            title: filename,
+          });
+          setStatus('共有シートから「ファイルに保存」を選んでください', 'ok');
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+          return;
+        } catch (shareErr) {
+          // 共有がキャンセルされたり失敗した場合は次の方法へ
+          console.log('Share failed, fallback...', shareErr);
         }
-      }, 150);
+      }
+
+      // 共有が使えない場合：新しいタブで開く
+      setStatus('新しいタブで開きます。長押し →「ビデオを書き出す」または「ファイルに保存」を選んでください', 'ok');
+      setTimeout(() => {
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = filename;   // できるだけファイル名を指定
+        a.target = '_blank';
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }, 100);
+
       setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
     } else {
+      // PC・Android向け
       const a = document.createElement('a');
       a.href = blobUrl;
       a.download = filename;
@@ -113,7 +144,7 @@ dlBtn.addEventListener('click', async () => {
       a.click();
       a.remove();
       URL.revokeObjectURL(blobUrl);
-      setStatus('ダウンロードを開始しました', 'ok');
+      setStatus('ダウンロードを開始しました（' + filename + '）', 'ok');
     }
   } catch (err) {
     setStatus(err.message, 'error');
