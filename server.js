@@ -43,18 +43,17 @@ function getViewkey(url) {
 function getHeaders(referer = 'https://www.pornhub.com/') {
   return {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': '*/*',
     'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
     'Referer': referer,
     'Origin': 'https://www.pornhub.com',
   };
 }
 
-// 一時フォルダ作成
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'phdl-'));
 }
 
-// フォルダごと削除
 function removeDir(dir) {
   try {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -82,7 +81,6 @@ async function extractFormats(pageUrl) {
   let mediaDefinitions = null;
   let title = 'video';
 
-  // flashvars_数字
   const fvMatch = html.match(/var\s+flashvars_\d+\s*=\s*(\{[\s\S]*?\});/);
   if (fvMatch) {
     try {
@@ -92,7 +90,6 @@ async function extractFormats(pageUrl) {
     } catch (_) {}
   }
 
-  // 別パターン
   if (!mediaDefinitions) {
     const m = html.match(/"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
     if (m) {
@@ -100,7 +97,6 @@ async function extractFormats(pageUrl) {
     }
   }
 
-  // APIフォールバック
   if (!mediaDefinitions) {
     try {
       const apiRes = await fetch('https://www.pornhub.com/video/get_media_definitions_v2', {
@@ -148,7 +144,6 @@ async function extractFormats(pageUrl) {
     .filter(f => f.height > 0)
     .sort((a, b) => b.height - a.height);
 
-  // 重複除去
   const seen = new Set();
   const unique = formats.filter(f => {
     if (seen.has(f.url)) return false;
@@ -160,15 +155,87 @@ async function extractFormats(pageUrl) {
   return { title, formats: unique };
 }
 
-// ffmpegでHLS → MP4変換
-function convertWithFfmpeg(inputUrl, outputPath, referer) {
+// m3u8の中身を取得してセグメントURLリストを返す
+async function getSegmentUrls(m3u8Url, referer) {
+  const res = await fetch(m3u8Url, { headers: getHeaders(referer) });
+  if (!res.ok) throw new Error('m3u8の取得に失敗しました');
+  const text = await res.text();
+
+  // マスタープレイリストなら一番高い帯域を選択
+  if (text.includes('#EXT-X-STREAM-INF')) {
+    const lines = text.split('\n');
+    let bestUrl = null;
+    let bestBw = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].includes('BANDWIDTH=')) {
+        const bw = parseInt(lines[i].match(/BANDWIDTH=(\d+)/)?.[1] || '0');
+        const next = lines[i + 1]?.trim();
+        if (next && !next.startsWith('#') && bw >= bestBw) {
+          bestBw = bw;
+          bestUrl = new URL(next, m3u8Url).href;
+        }
+      }
+    }
+    if (bestUrl) return getSegmentUrls(bestUrl, referer);
+  }
+
+  const segments = [];
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (t && !t.startsWith('#')) {
+      try {
+        segments.push(new URL(t, m3u8Url).href);
+      } catch (_) {}
+    }
+  }
+  return segments;
+}
+
+// セグメントをダウンロードしてローカルに保存
+async function downloadSegments(segmentUrls, tempDir, referer) {
+  const localFiles = [];
+
+  for (let i = 0; i < segmentUrls.length; i++) {
+    const segUrl = segmentUrls[i];
+    const localPath = path.join(tempDir, `seg_${String(i).padStart(5, '0')}.ts`);
+
+    const res = await fetch(segUrl, { headers: getHeaders(referer) });
+    if (!res.ok) {
+      console.warn(`セグメント ${i} 取得失敗: ${res.status}`);
+      continue;
+    }
+
+    const buffer = await res.buffer();
+    fs.writeFileSync(localPath, buffer);
+    localFiles.push(localPath);
+
+    if (i % 20 === 0) {
+      console.log(`セグメント進捗: ${i + 1}/${segmentUrls.length}`);
+    }
+  }
+
+  if (localFiles.length === 0) {
+    throw new Error('セグメントを1つもダウンロードできませんでした');
+  }
+
+  return localFiles;
+}
+
+// ローカルのtsファイルをffmpegでMP4に変換
+function convertLocalTsToMp4(localFiles, outputPath) {
   return new Promise((resolve, reject) => {
+    // concat用のリストファイルを作成
+    const listPath = path.join(path.dirname(outputPath), 'concat.txt');
+    const listContent = localFiles.map(f => `file '${f.replace(/\\/g, '/')}'`).join('\n');
+    fs.writeFileSync(listPath, listContent);
+
     const args = [
       '-y',
-      '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      '-headers', `Referer: ${referer}\r\n`,
-      '-i', inputUrl,
-      '-c', 'copy',          // 再エンコードせずコピー（速い）
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', listPath,
+      '-c', 'copy',
       '-bsf:a', 'aac_adtstoasc',
       '-movflags', '+faststart',
       outputPath,
@@ -183,7 +250,9 @@ function convertWithFfmpeg(inputUrl, outputPath, referer) {
       if (code === 0 && fs.existsSync(outputPath)) {
         resolve();
       } else {
-        reject(new Error('ffmpeg変換に失敗しました\n' + stderr.slice(-500)));
+        // エラーの最後の部分だけ返す
+        const last = stderr.split('\n').slice(-8).join('\n');
+        reject(new Error('ffmpeg変換に失敗しました\n' + last));
       }
     });
 
@@ -213,13 +282,19 @@ app.post('/api/download', checkKey, async (req, res) => {
     const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 80);
     const filename = `${safeTitle}_${selected.quality}p.mp4`;
 
-    // ===== HLSの場合はffmpegで変換 =====
     if (selected.isHls) {
       tempDir = makeTempDir();
       const outputPath = path.join(tempDir, 'output.mp4');
 
-      console.log('Converting HLS with ffmpeg...');
-      await convertWithFfmpeg(selected.url, outputPath, url);
+      console.log('1. m3u8解析中...');
+      const segmentUrls = await getSegmentUrls(selected.url, url);
+      console.log(`セグメント数: ${segmentUrls.length}`);
+
+      console.log('2. セグメントダウンロード中...');
+      const localFiles = await downloadSegments(segmentUrls, tempDir, url);
+
+      console.log('3. ffmpegでMP4変換中...');
+      await convertLocalTsToMp4(localFiles, outputPath);
 
       const stat = fs.statSync(outputPath);
       res.setHeader('Content-Type', 'video/mp4');
@@ -238,7 +313,7 @@ app.post('/api/download', checkKey, async (req, res) => {
       return;
     }
 
-    // ===== 普通のMP4 =====
+    // 普通のMP4
     const videoRes = await fetch(selected.url, { headers: getHeaders(url) });
     if (!videoRes.ok) throw new Error('動画の取得に失敗しました');
 
