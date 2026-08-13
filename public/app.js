@@ -5,7 +5,7 @@ const dlBtn = document.getElementById('dlBtn');
 const statusEl = document.getElementById('status');
 const formatsEl = document.getElementById('formats');
 
-// ローカルにキーを覚えておく
+// APIキーを記憶
 keyInput.value = localStorage.getItem('ph_api_key') || '';
 keyInput.addEventListener('change', () => {
   localStorage.setItem('ph_api_key', keyInput.value);
@@ -19,7 +19,10 @@ function setStatus(msg, type = '') {
 infoBtn.addEventListener('click', async () => {
   const url = urlInput.value.trim();
   const key = keyInput.value.trim();
-  if (!url || !key) return setStatus('URLとAPIキーを入力してください', 'error');
+
+  if (!url || !key) {
+    return setStatus('URLとAPIキーを入力してください', 'error');
+  }
 
   setStatus('情報を取得中...');
   formatsEl.innerHTML = '';
@@ -34,12 +37,16 @@ infoBtn.addEventListener('click', async () => {
       },
       body: JSON.stringify({ url }),
     });
+
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '失敗しました');
 
     setStatus(`タイトル: ${data.title}`, 'ok');
-    formatsEl.innerHTML = '<strong>利用可能な画質:</strong><br>' +
-      data.formats.map(f => `${f.quality || f.height}p (${f.isHls ? 'HLS' : 'MP4'})`).join('<br>');
+    formatsEl.innerHTML =
+      '<strong>利用可能な画質:</strong><br>' +
+      data.formats
+        .map(f => `${f.quality || f.height}p （${f.isHls ? 'HLS' : 'MP4'}）`)
+        .join('<br>');
   } catch (err) {
     setStatus(err.message, 'error');
   } finally {
@@ -50,19 +57,15 @@ infoBtn.addEventListener('click', async () => {
 dlBtn.addEventListener('click', async () => {
   const url = urlInput.value.trim();
   const key = keyInput.value.trim();
-  if (!url || !key) return setStatus('URLとAPIキーを入力してください', 'error');
+
+  if (!url || !key) {
+    return setStatus('URLとAPIキーを入力してください', 'error');
+  }
 
   setStatus('ダウンロード準備中...（時間がかかる場合があります）');
   dlBtn.disabled = true;
 
   try {
-    // 直接ダウンロードを開始
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = '/api/download';
-    form.style.display = 'none';
-
-    // fetchでblobを取る方法（進捗は出ないが確実）
     const res = await fetch('/api/download', {
       method: 'POST',
       headers: {
@@ -79,13 +82,18 @@ dlBtn.addEventListener('click', async () => {
 
     const blob = await res.blob();
     const disp = res.headers.get('Content-Disposition') || '';
-    const match = disp.match(/filename="?([^"]+)"?/);
-    const filename = match ? match[1] : 'video.mp4';
+    const match = disp.match(/filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i);
+    let filename = 'video.mp4';
+    if (match) {
+      filename = decodeURIComponent(match[1] || match[2] || 'video.mp4');
+    }
 
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = filename;
+    document.body.appendChild(a);
     a.click();
+    a.remove();
     URL.revokeObjectURL(a.href);
 
     setStatus('ダウンロードを開始しました', 'ok');
