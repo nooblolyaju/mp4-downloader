@@ -50,7 +50,19 @@ infoBtn.addEventListener('click', async () => {
       return;
     }
 
-    let html = '<strong>利用可能な画質:</strong><br>';
+    let html = '';
+
+    // サムネイル表示
+    if (data.thumbnail) {
+      html += `
+        <div style="margin-bottom:14px;">
+          <img src="${data.thumbnail}" alt="thumbnail"
+               style="max-width:100%; border-radius:8px; border:1px solid #333; display:block;">
+        </div>
+      `;
+    }
+
+    html += '<strong>利用可能な画質:</strong><br>';
     html += formats.map(f => `${f.quality}p （${f.isHls ? 'HLS → MP4変換' : 'MP4'}）`).join('<br>');
     html += '<br><br><span style="color:#4caf50">※ HLSはサーバーで本物のMP4に変換してからダウンロードします</span>';
 
@@ -85,25 +97,22 @@ dlBtn.addEventListener('click', async () => {
       throw new Error(err.error || `エラー ${res.status}`);
     }
 
-    // ファイル名を取得（必ず.mp4にする）
+    // ファイル名取得（必ず.mp4）
     const disp = res.headers.get('Content-Disposition') || '';
     const match = disp.match(/filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i);
     let filename = 'video.mp4';
     if (match) {
       filename = decodeURIComponent(match[1] || match[2] || 'video.mp4');
     }
-    // 拡張子がなければ強制的に.mp4を付ける
     if (!filename.toLowerCase().endsWith('.mp4')) {
       filename += '.mp4';
     }
 
     const blob = await res.blob();
-    // MIMEタイプを明示的にvideo/mp4にする
     const mp4Blob = new Blob([blob], { type: 'video/mp4' });
     const blobUrl = URL.createObjectURL(mp4Blob);
 
     if (isIOS()) {
-      // iOS向け：共有シートを優先（ファイル名が付きやすい）
       const file = new File([mp4Blob], filename, { type: 'video/mp4' });
 
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
@@ -116,17 +125,15 @@ dlBtn.addEventListener('click', async () => {
           setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
           return;
         } catch (shareErr) {
-          // 共有がキャンセルされたり失敗した場合は次の方法へ
           console.log('Share failed, fallback...', shareErr);
         }
       }
 
-      // 共有が使えない場合：新しいタブで開く
-      setStatus('新しいタブで開きます。長押し →「ビデオを書き出す」または「ファイルに保存」を選んでください', 'ok');
+      setStatus('新しいタブで開きます。長押し →「ファイルに保存」を選んでください', 'ok');
       setTimeout(() => {
         const a = document.createElement('a');
         a.href = blobUrl;
-        a.download = filename;   // できるだけファイル名を指定
+        a.download = filename;
         a.target = '_blank';
         a.rel = 'noopener';
         document.body.appendChild(a);
@@ -136,7 +143,6 @@ dlBtn.addEventListener('click', async () => {
 
       setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
     } else {
-      // PC・Android向け
       const a = document.createElement('a');
       a.href = blobUrl;
       a.download = filename;
