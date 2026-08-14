@@ -20,6 +20,10 @@ function isIOS() {
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 }
 
+function isLineBrowser() {
+  return /Line\//i.test(navigator.userAgent);
+}
+
 infoBtn.addEventListener('click', async () => {
   const url = urlInput.value.trim();
   const key = keyInput.value.trim();
@@ -42,7 +46,6 @@ infoBtn.addEventListener('click', async () => {
     if (!res.ok) throw new Error(data.error || '失敗しました');
 
     const formats = (data.formats || []).filter(f => Number(f.height) > 0);
-
     setStatus(`タイトル: ${data.title}`, 'ok');
 
     if (!formats.length) {
@@ -51,8 +54,6 @@ infoBtn.addEventListener('click', async () => {
     }
 
     let html = '';
-
-    // サムネイル表示
     if (data.thumbnail) {
       html += `
         <div style="margin-bottom:14px;">
@@ -79,8 +80,9 @@ dlBtn.addEventListener('click', async () => {
   const key = keyInput.value.trim();
   if (!url || !key) return setStatus('URLとAPIキーを入力してください', 'error');
 
-  setStatus('変換・ダウンロード準備中...（1〜3分かかることがあります）');
+  setStatus('変換中です...（1〜3分かかることがあります）');
   dlBtn.disabled = true;
+  formatsEl.innerHTML = '';
 
   try {
     const res = await fetch('/api/download', {
@@ -92,65 +94,58 @@ dlBtn.addEventListener('click', async () => {
       body: JSON.stringify({ url }),
     });
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || `エラー ${res.status}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `エラー ${res.status}`);
+
+    const downloadUrl = data.downloadUrl;
+    const playUrl = data.token ? `/api/play/${data.token}` : null;
+    const filename = data.filename || 'video.mp4';
+
+    // LINE / iPhone向け：直リンクを表示
+    let html = `
+      <div style="margin-top:12px; padding:14px; background:#222; border-radius:10px; border:1px solid #444;">
+        <div style="margin-bottom:10px; color:#4caf50; font-weight:bold;">変換完了: ${filename}</div>
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          <a href="${downloadUrl}" 
+             style="display:block; text-align:center; padding:12px; background:#ff9000; color:#000; border-radius:8px; font-weight:bold; text-decoration:none;">
+            📥 ダウンロード（保存）
+          </a>
+    `;
+
+    if (playUrl) {
+      html += `
+          <a href="${playUrl}" target="_blank" rel="noopener"
+             style="display:block; text-align:center; padding:12px; background:#333; color:#fff; border-radius:8px; font-weight:bold; text-decoration:none;">
+            ▶️ 再生する
+          </a>
+      `;
     }
 
-    // ファイル名取得（必ず.mp4）
-    const disp = res.headers.get('Content-Disposition') || '';
-    const match = disp.match(/filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i);
-    let filename = 'video.mp4';
-    if (match) {
-      filename = decodeURIComponent(match[1] || match[2] || 'video.mp4');
-    }
-    if (!filename.toLowerCase().endsWith('.mp4')) {
-      filename += '.mp4';
-    }
+    html += `
+        </div>
+        <div style="margin-top:12px; font-size:0.85rem; color:#aaa; line-height:1.5;">
+          【LINEの場合】<br>
+          1. 「ダウンロード」をタップ<br>
+          2. 右上メニュー → 「ブラウザで開く」が出たらそれを使うと保存しやすいです<br>
+          3. または長押しして「リンクを保存」/「ファイルに保存」
+        </div>
+        <div style="margin-top:8px; font-size:0.8rem; color:#888;">
+          ※ リンクの有効期限は約15分です
+        </div>
+      </div>
+    `;
 
-    const blob = await res.blob();
-    const mp4Blob = new Blob([blob], { type: 'video/mp4' });
-    const blobUrl = URL.createObjectURL(mp4Blob);
+    formatsEl.innerHTML = html;
+    setStatus('変換完了。下のボタンから保存または再生してください', 'ok');
 
-    if (isIOS()) {
-      const file = new File([mp4Blob], filename, { type: 'video/mp4' });
-
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        try {
-          await navigator.share({
-            files: [file],
-            title: filename,
-          });
-          setStatus('共有シートから「ファイルに保存」を選んでください', 'ok');
-          setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-          return;
-        } catch (shareErr) {
-          console.log('Share failed, fallback...', shareErr);
-        }
-      }
-
-      setStatus('新しいタブで開きます。長押し →「ファイルに保存」を選んでください', 'ok');
-      setTimeout(() => {
-        const a = document.createElement('a');
-        a.href = blobUrl;
-        a.download = filename;
-        a.target = '_blank';
-        a.rel = 'noopener';
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      }, 100);
-
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
-    } else {
+    // PCなどでは自動でダウンロードも試す
+    if (!isLineBrowser() && !isIOS()) {
       const a = document.createElement('a');
-      a.href = blobUrl;
+      a.href = downloadUrl;
       a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(blobUrl);
-      setStatus('ダウンロードを開始しました（' + filename + '）', 'ok');
     }
   } catch (err) {
     setStatus(err.message, 'error');
