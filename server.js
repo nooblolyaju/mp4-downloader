@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3456;
 const API_KEY = process.env.API_KEY || 'your-secret-key-here';
 
-// 一時ファイル管理（トークン → { path, filename, expiresAt }）
+// 一時ファイル管理（トークン → { path, dir, filename, expiresAt }）
 const tempFiles = new Map();
 const TEMP_TTL_MS = 15 * 60 * 1000; // 15分で削除
 
@@ -79,7 +79,7 @@ function cleanupExpiredFiles() {
 }
 setInterval(cleanupExpiredFiles, 60 * 1000);
 
-// フォーマット抽出
+// ===================== 情報抽出 =====================
 async function extractFormats(pageUrl) {
   const viewkey = getViewkey(pageUrl);
   if (!viewkey) throw new Error('viewkey が見つかりません');
@@ -186,6 +186,7 @@ async function extractFormats(pageUrl) {
   return { title, thumbnail, formats: unique };
 }
 
+// ===================== HLS処理 =====================
 async function getSegmentUrls(m3u8Url, referer) {
   const res = await fetch(m3u8Url, { headers: getHeaders(referer) });
   if (!res.ok) throw new Error('m3u8の取得に失敗しました');
@@ -221,30 +222,87 @@ async function getSegmentUrls(m3u8Url, referer) {
   return segments;
 }
 
+// 1本のセグメントをリトライ付きで取得
+async function fetchSegmentWithRetry(segUrl, referer, retries = 4) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+
+      const res = await fetch(segUrl, {
+        headers: getHeaders(referer),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const buffer = await res.buffer();
+      if (!buffer || buffer.length === 0) {
+        throw new Error('空のセグメント');
+      }
+      return buffer;
+    } catch (err) {
+      lastError = err;
+      const msg = err.message || String(err);
+      console.warn(`セグメント取得失敗 (試行 ${attempt}/${retries}): ${msg}`);
+
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 500 * attempt));
+      }
+    }
+  }
+
+  throw lastError || new Error('セグメント取得に失敗しました');
+}
+
+// セグメントをローカルにダウンロード（リトライ対応）
 async function downloadSegments(segmentUrls, tempDir, referer) {
   const localFiles = [];
+  let failCount = 0;
+  const maxFails = Math.max(5, Math.floor(segmentUrls.length * 0.1));
 
   for (let i = 0; i < segmentUrls.length; i++) {
     const segUrl = segmentUrls[i];
     const localPath = path.join(tempDir, `seg_${String(i).padStart(5, '0')}.ts`);
 
-    const res = await fetch(segUrl, { headers: getHeaders(referer) });
-    if (!res.ok) {
-      console.warn(`セグメント ${i} 取得失敗: ${res.status}`);
-      continue;
+    try {
+      const buffer = await fetchSegmentWithRetry(segUrl, referer, 4);
+      fs.writeFileSync(localPath, buffer);
+      localFiles.push(localPath);
+    } catch (err) {
+      failCount++;
+      console.warn(`セグメント ${i + 1}/${segmentUrls.length} をスキップ: ${err.message}`);
+
+      if (failCount > maxFails) {
+        throw new Error(
+          `セグメントの取得失敗が多すぎます（${failCount}本）。CDN接続が不安定です。少し待って再試行してください。`
+        );
+      }
     }
 
-    const buffer = await res.buffer();
-    fs.writeFileSync(localPath, buffer);
-    localFiles.push(localPath);
+    // CDN切断対策で少し間隔を空ける
+    if (i % 5 === 4) {
+      await new Promise(r => setTimeout(r, 200));
+    }
 
-    if (i % 20 === 0) {
-      console.log(`セグメント進捗: ${i + 1}/${segmentUrls.length}`);
+    if (i % 20 === 0 || i === segmentUrls.length - 1) {
+      console.log(`セグメント進捗: ${i + 1}/${segmentUrls.length}（成功 ${localFiles.length}）`);
     }
   }
 
   if (localFiles.length === 0) {
     throw new Error('セグメントを1つもダウンロードできませんでした');
+  }
+
+  if (localFiles.length < segmentUrls.length * 0.7) {
+    throw new Error(
+      `取得できたセグメントが少なすぎます（${localFiles.length}/${segmentUrls.length}）。再試行してください。`
+    );
   }
 
   return localFiles;
@@ -331,6 +389,8 @@ async function prepareDownloadFile(pageUrl, quality) {
   return { token, filename };
 }
 
+// ===================== API =====================
+
 // 情報取得
 app.post('/api/info', checkKey, async (req, res) => {
   const { url } = req.body || {};
@@ -357,12 +417,12 @@ app.post('/api/download', checkKey, async (req, res) => {
 
   try {
     const { token, filename } = await prepareDownloadFile(url, quality);
-    // LINEブラウザ向けに「直リンク」を返す
     res.json({
       ok: true,
       token,
       filename,
       downloadUrl: `/api/file/${token}`,
+      playUrl: `/api/play/${token}`,
       expiresInSec: Math.floor(TEMP_TTL_MS / 1000),
     });
   } catch (err) {
@@ -371,7 +431,7 @@ app.post('/api/download', checkKey, async (req, res) => {
   }
 });
 
-// 実際のファイル配信（GETで開ける＝LINEでも保存しやすい）
+// 実際のファイル配信（保存用）
 app.get('/api/file/:token', (req, res) => {
   cleanupExpiredFiles();
 
@@ -393,7 +453,7 @@ app.get('/api/file/:token', (req, res) => {
   fs.createReadStream(info.path).pipe(res);
 });
 
-// ブラウザでそのまま再生したい場合用（inline）
+// 再生用（inline）
 app.get('/api/play/:token', (req, res) => {
   cleanupExpiredFiles();
 
