@@ -3,6 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const fetch = require('node-fetch');
 const ffmpegPath = require('ffmpeg-static');
@@ -10,6 +11,10 @@ const ffmpegPath = require('ffmpeg-static');
 const app = express();
 const PORT = process.env.PORT || 3456;
 const API_KEY = process.env.API_KEY || 'your-secret-key-here';
+
+// 一時ファイル管理（トークン → { path, filename, expiresAt }）
+const tempFiles = new Map();
+const TEMP_TTL_MS = 15 * 60 * 1000; // 15分で削除
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -60,7 +65,21 @@ function removeDir(dir) {
   } catch (_) {}
 }
 
-// フォーマット抽出（サムネイル対応）
+function cleanupExpiredFiles() {
+  const now = Date.now();
+  for (const [token, info] of tempFiles.entries()) {
+    if (info.expiresAt <= now) {
+      try {
+        if (info.path && fs.existsSync(info.path)) fs.unlinkSync(info.path);
+        if (info.dir) removeDir(info.dir);
+      } catch (_) {}
+      tempFiles.delete(token);
+    }
+  }
+}
+setInterval(cleanupExpiredFiles, 60 * 1000);
+
+// フォーマット抽出
 async function extractFormats(pageUrl) {
   const viewkey = getViewkey(pageUrl);
   if (!viewkey) throw new Error('viewkey が見つかりません');
@@ -82,7 +101,6 @@ async function extractFormats(pageUrl) {
   let title = 'video';
   let thumbnail = null;
 
-  // flashvars から取得
   const fvMatch = html.match(/var\s+flashvars_\d+\s*=\s*(\{[\s\S]*?\});/);
   if (fvMatch) {
     try {
@@ -93,7 +111,6 @@ async function extractFormats(pageUrl) {
     } catch (_) {}
   }
 
-  // mediaDefinitions 別パターン
   if (!mediaDefinitions) {
     const m = html.match(/"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
     if (m) {
@@ -101,15 +118,11 @@ async function extractFormats(pageUrl) {
     }
   }
 
-  // image_url フォールバック
   if (!thumbnail) {
     const imgMatch = html.match(/"image_url"\s*:\s*"([^"]+)"/);
-    if (imgMatch) {
-      thumbnail = imgMatch[1];
-    }
+    if (imgMatch) thumbnail = imgMatch[1];
   }
 
-  // APIフォールバック
   if (!mediaDefinitions) {
     try {
       const apiRes = await fetch('https://www.pornhub.com/video/get_media_definitions_v2', {
@@ -132,7 +145,6 @@ async function extractFormats(pageUrl) {
     throw new Error('動画情報を抽出できませんでした');
   }
 
-  // タイトルフォールバック
   if (title === 'video') {
     const t = html.match(/<title[^>]*>([^<]+)<\/title>/i);
     if (t) {
@@ -140,7 +152,6 @@ async function extractFormats(pageUrl) {
     }
   }
 
-  // エスケープされたスラッシュを戻す
   if (thumbnail) {
     thumbnail = thumbnail.replace(/\\\//g, '/');
   }
@@ -163,7 +174,6 @@ async function extractFormats(pageUrl) {
     .filter(f => f.height > 0)
     .sort((a, b) => b.height - a.height);
 
-  // 重複除去
   const seen = new Set();
   const unique = formats.filter(f => {
     if (seen.has(f.url)) return false;
@@ -173,14 +183,9 @@ async function extractFormats(pageUrl) {
 
   if (!unique.length) throw new Error('利用可能なフォーマットがありません');
 
-  return {
-    title,
-    thumbnail,
-    formats: unique,
-  };
+  return { title, thumbnail, formats: unique };
 }
 
-// m3u8からセグメントURLリストを取得
 async function getSegmentUrls(m3u8Url, referer) {
   const res = await fetch(m3u8Url, { headers: getHeaders(referer) });
   if (!res.ok) throw new Error('m3u8の取得に失敗しました');
@@ -216,7 +221,6 @@ async function getSegmentUrls(m3u8Url, referer) {
   return segments;
 }
 
-// セグメントをローカルにダウンロード
 async function downloadSegments(segmentUrls, tempDir, referer) {
   const localFiles = [];
 
@@ -246,7 +250,6 @@ async function downloadSegments(segmentUrls, tempDir, referer) {
   return localFiles;
 }
 
-// ローカルtsをMP4に変換
 function convertLocalTsToMp4(localFiles, outputPath) {
   return new Promise((resolve, reject) => {
     const listPath = path.join(path.dirname(outputPath), 'concat.txt');
@@ -282,77 +285,53 @@ function convertLocalTsToMp4(localFiles, outputPath) {
   });
 }
 
-// ダウンロードAPI
-app.post('/api/download', checkKey, async (req, res) => {
-  const { url, quality } = req.body || {};
-  if (!url) return res.status(400).json({ error: 'URLを入力してください' });
-  if (!isPornhubUrl(url)) {
-    return res.status(400).json({ error: '有効なPornHubのURLを入力してください' });
+// 変換して一時保存し、ダウンロード用トークンを返す
+async function prepareDownloadFile(pageUrl, quality) {
+  const { title, formats } = await extractFormats(pageUrl);
+
+  let selected = formats[0];
+  if (quality) {
+    const found = formats.find(
+      f => String(f.quality) === String(quality) || String(f.height) === String(quality)
+    );
+    if (found) selected = found;
   }
 
-  let tempDir = null;
+  const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 80);
+  const filename = `${safeTitle}_${selected.quality}p.mp4`;
 
-  try {
-    const { title, formats } = await extractFormats(url);
+  const tempDir = makeTempDir();
+  const outputPath = path.join(tempDir, 'output.mp4');
 
-    let selected = formats[0];
-    if (quality) {
-      const found = formats.find(f => String(f.quality) === String(quality) || String(f.height) === String(quality));
-      if (found) selected = found;
-    }
+  if (selected.isHls) {
+    console.log('1. m3u8解析中...');
+    const segmentUrls = await getSegmentUrls(selected.url, pageUrl);
+    console.log(`セグメント数: ${segmentUrls.length}`);
 
-    const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 80);
-    const filename = `${safeTitle}_${selected.quality}p.mp4`;
+    console.log('2. セグメントダウンロード中...');
+    const localFiles = await downloadSegments(segmentUrls, tempDir, pageUrl);
 
-    if (selected.isHls) {
-      tempDir = makeTempDir();
-      const outputPath = path.join(tempDir, 'output.mp4');
-
-      console.log('1. m3u8解析中...');
-      const segmentUrls = await getSegmentUrls(selected.url, url);
-      console.log(`セグメント数: ${segmentUrls.length}`);
-
-      console.log('2. セグメントダウンロード中...');
-      const localFiles = await downloadSegments(segmentUrls, tempDir, url);
-
-      console.log('3. ffmpegでMP4変換中...');
-      await convertLocalTsToMp4(localFiles, outputPath);
-
-      const stat = fs.statSync(outputPath);
-      res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Content-Length', stat.size);
-      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-
-      const stream = fs.createReadStream(outputPath);
-      stream.pipe(res);
-
-      stream.on('close', () => removeDir(tempDir));
-      stream.on('error', () => {
-        removeDir(tempDir);
-        if (!res.headersSent) res.status(500).end();
-      });
-
-      return;
-    }
-
-    // 普通のMP4
-    const videoRes = await fetch(selected.url, { headers: getHeaders(url) });
+    console.log('3. ffmpegでMP4変換中...');
+    await convertLocalTsToMp4(localFiles, outputPath);
+  } else {
+    const videoRes = await fetch(selected.url, { headers: getHeaders(pageUrl) });
     if (!videoRes.ok) throw new Error('動画の取得に失敗しました');
-
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-    videoRes.body.pipe(res);
-
-  } catch (err) {
-    console.error(err);
-    if (tempDir) removeDir(tempDir);
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message || 'ダウンロードに失敗しました' });
-    }
+    const buffer = await videoRes.buffer();
+    fs.writeFileSync(outputPath, buffer);
   }
-});
 
-// 情報取得API
+  const token = crypto.randomBytes(16).toString('hex');
+  tempFiles.set(token, {
+    path: outputPath,
+    dir: tempDir,
+    filename,
+    expiresAt: Date.now() + TEMP_TTL_MS,
+  });
+
+  return { token, filename };
+}
+
+// 情報取得
 app.post('/api/info', checkKey, async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: 'URLを入力してください' });
@@ -366,6 +345,74 @@ app.post('/api/info', checkKey, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ダウンロード準備（変換してトークン発行）
+app.post('/api/download', checkKey, async (req, res) => {
+  const { url, quality } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'URLを入力してください' });
+  if (!isPornhubUrl(url)) {
+    return res.status(400).json({ error: '有効なPornHubのURLを入力してください' });
+  }
+
+  try {
+    const { token, filename } = await prepareDownloadFile(url, quality);
+    // LINEブラウザ向けに「直リンク」を返す
+    res.json({
+      ok: true,
+      token,
+      filename,
+      downloadUrl: `/api/file/${token}`,
+      expiresInSec: Math.floor(TEMP_TTL_MS / 1000),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'ダウンロードに失敗しました' });
+  }
+});
+
+// 実際のファイル配信（GETで開ける＝LINEでも保存しやすい）
+app.get('/api/file/:token', (req, res) => {
+  cleanupExpiredFiles();
+
+  const info = tempFiles.get(req.params.token);
+  if (!info || !fs.existsSync(info.path)) {
+    return res.status(404).send('ファイルが見つかりません（期限切れの可能性があります）');
+  }
+
+  const stat = fs.statSync(info.path);
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename*=UTF-8''${encodeURIComponent(info.filename)}`
+  );
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'no-store');
+
+  fs.createReadStream(info.path).pipe(res);
+});
+
+// ブラウザでそのまま再生したい場合用（inline）
+app.get('/api/play/:token', (req, res) => {
+  cleanupExpiredFiles();
+
+  const info = tempFiles.get(req.params.token);
+  if (!info || !fs.existsSync(info.path)) {
+    return res.status(404).send('ファイルが見つかりません（期限切れの可能性があります）');
+  }
+
+  const stat = fs.statSync(info.path);
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader(
+    'Content-Disposition',
+    `inline; filename*=UTF-8''${encodeURIComponent(info.filename)}`
+  );
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'no-store');
+
+  fs.createReadStream(info.path).pipe(res);
 });
 
 app.listen(PORT, () => {
