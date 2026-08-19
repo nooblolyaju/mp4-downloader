@@ -13,11 +13,7 @@
 
     <div class="card">
       <label for="url">動画ページのURL（主に PornHub 用）</label>
-      <input
-        type="url"
-        id="url"
-        placeholder="https://www.pornhub.com/view_video.php?viewkey=..."
-      />
+      <input type="url" id="url" placeholder="https://www.pornhub.com/view_video.php?viewkey=..." />
 
       <label for="key">APIキー</label>
       <input type="password" id="key" placeholder="自分で設定したキー" />
@@ -26,7 +22,6 @@
         <button id="infoBtn" type="button">情報を取得</button>
         <button id="dlBtn" class="primary" type="button">ダウンロード</button>
       </div>
-
       <div class="row" style="margin-top: 10px;">
         <button id="proxyBtn" type="button">プロキシ確認</button>
       </div>
@@ -35,47 +30,31 @@
       <div id="formats" class="formats"></div>
     </div>
 
-    <!-- Iwara 用 -->
     <div class="card" style="margin-top: 16px;">
       <h2 style="font-size: 1.1rem; color: #ff9000; margin-bottom: 8px;">Iwara 用（ブックマークレット）</h2>
       <p style="font-size: 0.85rem; color: #aaa; line-height: 1.5; margin-bottom: 12px;">
-        サーバーが Cloudflare に弾かれるため、Iwara は<strong>動画ページ上</strong>で次のブックマークを実行してください。
+        サーバーが Cloudflare に弾かれるため、Iwara は<strong>動画ページ上</strong>でブックマークを実行してください。
       </p>
-
       <p style="font-size: 0.85rem; color: #ccc; line-height: 1.6; margin-bottom: 12px;">
-        <strong>iPhone での登録手順</strong><br />
-        1. 下の「コードをコピー」を押す<br />
-        2. Safari で適当なページをブックマーク<br />
-        3. ブックマークを編集 → URL欄を全部消してペースト<br />
-        4. 名前を「Iwara DL」などに変更して保存<br />
-        5. Iwara の動画ページを開いて、そのブックマークをタップ
+        <strong>iPhone</strong><br />
+        1. 「コードをコピー」<br />
+        2. 適当なページをブックマーク<br />
+        3. 編集 → URLを全部消してペースト<br />
+        4. 名前を「Iwara DL」に<br />
+        5. Iwara動画ページでそのブックマークをタップ
       </p>
-
       <div class="row">
         <button id="copyBmBtn" type="button">コードをコピー</button>
       </div>
-
       <p id="bmStatus" class="status" style="margin-top: 10px;"></p>
-
       <details style="margin-top: 12px;">
         <summary style="color: #999; font-size: 0.85rem; cursor: pointer;">コードを表示</summary>
-        <textarea id="bmCode" readonly rows="6" style="
-          width: 100%;
-          margin-top: 8px;
-          padding: 10px;
-          border-radius: 8px;
-          border: 1px solid #444;
-          background: #111;
-          color: #8f8;
-          font-size: 0.7rem;
-          font-family: monospace;
-        "></textarea>
+        <textarea id="bmCode" readonly rows="6" style="width:100%;margin-top:8px;padding:10px;border-radius:8px;border:1px solid #444;background:#111;color:#8f8;font-size:0.7rem;font-family:monospace;"></textarea>
       </details>
     </div>
 
     <p class="note">
-      PornHub: 上のフォームでOK<br />
-      Iwara: ブックマークレットを動画ページで実行<br />
+      PornHub: 上のフォーム / Iwara: ブックマークレット<br />
       ※ 利用は自己責任でお願いします
     </p>
   </div>
