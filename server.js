@@ -12,9 +12,8 @@ const app = express();
 const PORT = process.env.PORT || 3456;
 const API_KEY = process.env.API_KEY || 'your-secret-key-here';
 
-// 一時ファイル管理（トークン → { path, dir, filename, expiresAt }）
-const tempFiles = new Map();
-const TEMP_TTL_MS = 15 * 60 * 1000; // 15分で削除
+// Iwara の X-Version 用ソルト（2026年現在）
+const IWARA_XVERSION_SALT = 'mSvL05GfEmeEmsEYfGCnVpEjYgTJraJN';
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -28,35 +27,18 @@ function checkKey(req, res, next) {
   next();
 }
 
-function isPornhubUrl(url) {
-  try {
-    const hostname = new URL(url).hostname.toLowerCase();
-    return /(?:^|\.)pornhub\.com$/.test(hostname);
-  } catch {
-    return false;
-  }
-}
-
-function getViewkey(url) {
-  try {
-    return new URL(url).searchParams.get('viewkey');
-  } catch {
-    return null;
-  }
-}
-
 function getHeaders(referer = 'https://www.pornhub.com/') {
   return {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': '*/*',
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    Accept: '*/*',
     'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-    'Referer': referer,
-    'Origin': 'https://www.pornhub.com',
+    Referer: referer,
   };
 }
 
 function makeTempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'phdl-'));
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'vdl-'));
 }
 
 function removeDir(dir) {
@@ -65,22 +47,33 @@ function removeDir(dir) {
   } catch (_) {}
 }
 
-function cleanupExpiredFiles() {
-  const now = Date.now();
-  for (const [token, info] of tempFiles.entries()) {
-    if (info.expiresAt <= now) {
-      try {
-        if (info.path && fs.existsSync(info.path)) fs.unlinkSync(info.path);
-        if (info.dir) removeDir(info.dir);
-      } catch (_) {}
-      tempFiles.delete(token);
-    }
+// ========== ドメイン判定 ==========
+function isPornhubUrl(url) {
+  try {
+    return /(?:^|\.)pornhub\.com$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
   }
 }
-setInterval(cleanupExpiredFiles, 60 * 1000);
 
-// ===================== 情報抽出 =====================
-async function extractFormats(pageUrl) {
+function isIwaraUrl(url) {
+  try {
+    return /(?:^|\.)iwara\.tv$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// ========== Pornhub ==========
+function getViewkey(url) {
+  try {
+    return new URL(url).searchParams.get('viewkey');
+  } catch {
+    return null;
+  }
+}
+
+async function extractPornhub(pageUrl) {
   const viewkey = getViewkey(pageUrl);
   if (!viewkey) throw new Error('viewkey が見つかりません');
 
@@ -92,14 +85,12 @@ async function extractFormats(pageUrl) {
   if (!res.ok) throw new Error(`ページ取得失敗 (${res.status})`);
 
   const html = await res.text();
-
   if (html.includes('geoBlocked') || html.includes('unavailable in your country')) {
     throw new Error('地域制限により視聴できません');
   }
 
   let mediaDefinitions = null;
   let title = 'video';
-  let thumbnail = null;
 
   const fvMatch = html.match(/var\s+flashvars_\d+\s*=\s*(\{[\s\S]*?\});/);
   if (fvMatch) {
@@ -107,20 +98,16 @@ async function extractFormats(pageUrl) {
       const fv = JSON.parse(fvMatch[1]);
       if (Array.isArray(fv.mediaDefinitions)) mediaDefinitions = fv.mediaDefinitions;
       if (fv.video_title) title = fv.video_title;
-      if (fv.image_url) thumbnail = fv.image_url;
     } catch (_) {}
   }
 
   if (!mediaDefinitions) {
     const m = html.match(/"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
     if (m) {
-      try { mediaDefinitions = JSON.parse(m[1]); } catch (_) {}
+      try {
+        mediaDefinitions = JSON.parse(m[1]);
+      } catch (_) {}
     }
-  }
-
-  if (!thumbnail) {
-    const imgMatch = html.match(/"image_url"\s*:\s*"([^"]+)"/);
-    if (imgMatch) thumbnail = imgMatch[1];
   }
 
   if (!mediaDefinitions) {
@@ -148,21 +135,22 @@ async function extractFormats(pageUrl) {
   if (title === 'video') {
     const t = html.match(/<title[^>]*>([^<]+)<\/title>/i);
     if (t) {
-      title = t[1].replace(/\s*-\s*PornHub.*$/i, '').replace(/\s*\|.*$/i, '').trim() || 'video';
+      title =
+        t[1]
+          .replace(/\s*-\s*PornHub.*$/i, '')
+          .replace(/\s*\|.*$/i, '')
+          .trim() || 'video';
     }
   }
 
-  if (thumbnail) {
-    thumbnail = thumbnail.replace(/\\\//g, '/');
-  }
-
   const formats = mediaDefinitions
-    .filter(d => d?.videoUrl)
-    .map(d => {
+    .filter((d) => d?.videoUrl)
+    .map((d) => {
       let height = 0;
       if (typeof d.quality === 'number') height = d.quality;
       else if (typeof d.quality === 'string') height = parseInt(d.quality) || 0;
-      else if (Array.isArray(d.quality)) height = Math.max(...d.quality.map(q => parseInt(q) || 0));
+      else if (Array.isArray(d.quality))
+        height = Math.max(...d.quality.map((q) => parseInt(q) || 0));
 
       return {
         quality: height || 'unknown',
@@ -171,22 +159,20 @@ async function extractFormats(pageUrl) {
         isHls: d.format === 'hls' || String(d.videoUrl).includes('.m3u8'),
       };
     })
-    .filter(f => f.height > 0)
+    .filter((f) => f.height > 0)
     .sort((a, b) => b.height - a.height);
 
   const seen = new Set();
-  const unique = formats.filter(f => {
+  const unique = formats.filter((f) => {
     if (seen.has(f.url)) return false;
     seen.add(f.url);
     return true;
   });
 
   if (!unique.length) throw new Error('利用可能なフォーマットがありません');
-
-  return { title, thumbnail, formats: unique };
+  return { title, formats, site: 'pornhub' };
 }
 
-// ===================== HLS処理 =====================
 async function getSegmentUrls(m3u8Url, referer) {
   const res = await fetch(m3u8Url, { headers: getHeaders(referer) });
   if (!res.ok) throw new Error('m3u8の取得に失敗しました');
@@ -196,7 +182,6 @@ async function getSegmentUrls(m3u8Url, referer) {
     const lines = text.split('\n');
     let bestUrl = null;
     let bestBw = 0;
-
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].includes('BANDWIDTH=')) {
         const bw = parseInt(lines[i].match(/BANDWIDTH=(\d+)/)?.[1] || '0');
@@ -222,257 +207,268 @@ async function getSegmentUrls(m3u8Url, referer) {
   return segments;
 }
 
-// 1本のセグメントをリトライ付きで取得
-async function fetchSegmentWithRetry(segUrl, referer, retries = 4) {
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30000);
-
-      const res = await fetch(segUrl, {
-        headers: getHeaders(referer),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      const buffer = await res.buffer();
-      if (!buffer || buffer.length === 0) {
-        throw new Error('空のセグメント');
-      }
-      return buffer;
-    } catch (err) {
-      lastError = err;
-      const msg = err.message || String(err);
-      console.warn(`セグメント取得失敗 (試行 ${attempt}/${retries}): ${msg}`);
-
-      if (attempt < retries) {
-        await new Promise(r => setTimeout(r, 500 * attempt));
-      }
-    }
-  }
-
-  throw lastError || new Error('セグメント取得に失敗しました');
-}
-
-// セグメントをローカルにダウンロード（リトライ対応）
 async function downloadSegments(segmentUrls, tempDir, referer) {
   const localFiles = [];
-  let failCount = 0;
-  const maxFails = Math.max(5, Math.floor(segmentUrls.length * 0.1));
-
   for (let i = 0; i < segmentUrls.length; i++) {
-    const segUrl = segmentUrls[i];
     const localPath = path.join(tempDir, `seg_${String(i).padStart(5, '0')}.ts`);
-
-    try {
-      const buffer = await fetchSegmentWithRetry(segUrl, referer, 4);
-      fs.writeFileSync(localPath, buffer);
-      localFiles.push(localPath);
-    } catch (err) {
-      failCount++;
-      console.warn(`セグメント ${i + 1}/${segmentUrls.length} をスキップ: ${err.message}`);
-
-      if (failCount > maxFails) {
-        throw new Error(
-          `セグメントの取得失敗が多すぎます（${failCount}本）。CDN接続が不安定です。少し待って再試行してください。`
-        );
-      }
-    }
-
-    // CDN切断対策で少し間隔を空ける
-    if (i % 5 === 4) {
-      await new Promise(r => setTimeout(r, 200));
-    }
-
-    if (i % 20 === 0 || i === segmentUrls.length - 1) {
-      console.log(`セグメント進捗: ${i + 1}/${segmentUrls.length}（成功 ${localFiles.length}）`);
-    }
+    const res = await fetch(segmentUrls[i], { headers: getHeaders(referer) });
+    if (!res.ok) continue;
+    fs.writeFileSync(localPath, await res.buffer());
+    localFiles.push(localPath);
+    if (i % 20 === 0) console.log(`セグメント: ${i + 1}/${segmentUrls.length}`);
   }
-
-  if (localFiles.length === 0) {
-    throw new Error('セグメントを1つもダウンロードできませんでした');
-  }
-
-  if (localFiles.length < segmentUrls.length * 0.7) {
-    throw new Error(
-      `取得できたセグメントが少なすぎます（${localFiles.length}/${segmentUrls.length}）。再試行してください。`
-    );
-  }
-
+  if (!localFiles.length) throw new Error('セグメントを取得できませんでした');
   return localFiles;
 }
 
 function convertLocalTsToMp4(localFiles, outputPath) {
   return new Promise((resolve, reject) => {
     const listPath = path.join(path.dirname(outputPath), 'concat.txt');
-    const listContent = localFiles.map(f => `file '${f.replace(/\\/g, '/')}'`).join('\n');
-    fs.writeFileSync(listPath, listContent);
+    fs.writeFileSync(
+      listPath,
+      localFiles.map((f) => `file '${f.replace(/\\/g, '/')}'`).join('\n')
+    );
 
     const args = [
       '-y',
-      '-f', 'concat',
-      '-safe', '0',
-      '-i', listPath,
-      '-c', 'copy',
-      '-bsf:a', 'aac_adtstoasc',
-      '-movflags', '+faststart',
+      '-f',
+      'concat',
+      '-safe',
+      '0',
+      '-i',
+      listPath,
+      '-c',
+      'copy',
+      '-bsf:a',
+      'aac_adtstoasc',
+      '-movflags',
+      '+faststart',
       outputPath,
     ];
 
     const ff = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
     let stderr = '';
-    ff.stderr.on('data', d => { stderr += d.toString(); });
-
-    ff.on('close', code => {
-      if (code === 0 && fs.existsSync(outputPath)) {
-        resolve();
-      } else {
-        const last = stderr.split('\n').slice(-8).join('\n');
-        reject(new Error('ffmpeg変換に失敗しました\n' + last));
-      }
+    ff.stderr.on('data', (d) => {
+      stderr += d.toString();
     });
-
+    ff.on('close', (code) => {
+      if (code === 0 && fs.existsSync(outputPath)) resolve();
+      else reject(new Error('ffmpeg変換失敗\n' + stderr.split('\n').slice(-8).join('\n')));
+    });
     ff.on('error', reject);
   });
 }
 
-// 変換して一時保存し、ダウンロード用トークンを返す
-async function prepareDownloadFile(pageUrl, quality) {
-  const { title, formats } = await extractFormats(pageUrl);
-
-  let selected = formats[0];
-  if (quality) {
-    const found = formats.find(
-      f => String(f.quality) === String(quality) || String(f.height) === String(quality)
-    );
-    if (found) selected = found;
-  }
-
-  const safeTitle = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 80);
-  const filename = `${safeTitle}_${selected.quality}p.mp4`;
-
-  const tempDir = makeTempDir();
-  const outputPath = path.join(tempDir, 'output.mp4');
-
-  if (selected.isHls) {
-    console.log('1. m3u8解析中...');
-    const segmentUrls = await getSegmentUrls(selected.url, pageUrl);
-    console.log(`セグメント数: ${segmentUrls.length}`);
-
-    console.log('2. セグメントダウンロード中...');
-    const localFiles = await downloadSegments(segmentUrls, tempDir, pageUrl);
-
-    console.log('3. ffmpegでMP4変換中...');
-    await convertLocalTsToMp4(localFiles, outputPath);
-  } else {
-    const videoRes = await fetch(selected.url, { headers: getHeaders(pageUrl) });
-    if (!videoRes.ok) throw new Error('動画の取得に失敗しました');
-    const buffer = await videoRes.buffer();
-    fs.writeFileSync(outputPath, buffer);
-  }
-
-  const token = crypto.randomBytes(16).toString('hex');
-  tempFiles.set(token, {
-    path: outputPath,
-    dir: tempDir,
-    filename,
-    expiresAt: Date.now() + TEMP_TTL_MS,
-  });
-
-  return { token, filename };
+// ========== Iwara ==========
+function getIwaraVideoId(url) {
+  const m = String(url).match(/\/videos?\/([a-zA-Z0-9]+)/i);
+  return m ? m[1] : null;
 }
 
-// ===================== API =====================
+function makeIwaraXVersion(fileUrl) {
+  const u = new URL(fileUrl);
+  const fileId = u.pathname.replace(/\/$/, '').split('/').pop();
+  const expires = u.searchParams.get('expires');
+  if (!fileId || !expires) throw new Error('Iwara fileUrl の形式が不正です');
+  const raw = `${fileId}_${expires}_${IWARA_XVERSION_SALT}`;
+  return crypto.createHash('sha1').update(raw).digest('hex');
+}
+
+function toAbsoluteUrl(u) {
+  if (!u) return null;
+  if (u.startsWith('//')) return 'https:' + u;
+  if (u.startsWith('http')) return u;
+  return 'https://' + u.replace(/^\/+/, '');
+}
+
+async function extractIwara(pageUrl) {
+  const id = getIwaraVideoId(pageUrl);
+  if (!id) throw new Error('Iwaraの動画IDを取得できませんでした');
+
+  const metaRes = await fetch(`https://api.iwara.tv/video/${id}`, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      Accept: 'application/json',
+    },
+    timeout: 20000,
+  });
+
+  const text = await metaRes.text();
+  if (!metaRes.ok) {
+    if (text.includes('Just a moment') || text.includes('cf-mitigated')) {
+      throw new Error(
+        'Cloudflareにブロックされました。Renderからapi.iwara.tvへのアクセスが制限されている可能性があります'
+      );
+    }
+    throw new Error(`Iwara APIエラー: ${metaRes.status}`);
+  }
+
+  let meta;
+  try {
+    meta = JSON.parse(text);
+  } catch {
+    throw new Error('Iwara APIの応答がJSONではありません（Cloudflareの可能性）');
+  }
+
+  if (meta.message === 'errors.privateVideo') {
+    throw new Error('非公開動画です（ログインが必要）');
+  }
+  if (meta.message === 'errors.notFound') {
+    throw new Error('動画が見つかりません（またはログインが必要）');
+  }
+  if (meta.message) {
+    throw new Error(`Iwara: ${meta.message}`);
+  }
+
+  if (!meta.fileUrl) {
+    if (meta.embedUrl) throw new Error(`埋め込み動画です: ${meta.embedUrl}`);
+    throw new Error('この動画はダウンロードできません');
+  }
+
+  const xVersion = makeIwaraXVersion(meta.fileUrl);
+  const filesRes = await fetch(meta.fileUrl, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      Accept: 'application/json',
+      'X-Version': xVersion,
+    },
+    timeout: 20000,
+  });
+
+  if (!filesRes.ok) {
+    throw new Error(`画質情報の取得に失敗: ${filesRes.status}`);
+  }
+
+  const files = await filesRes.json();
+  if (!Array.isArray(files) || !files.length) {
+    throw new Error('画質一覧が空です');
+  }
+
+  const order = { Source: 4, '540': 3, '360': 2, preview: 0 };
+  files.sort((a, b) => (order[b.name] || 1) - (order[a.name] || 1));
+
+  const formats = files
+    .filter((f) => f?.src)
+    .map((f) => {
+      const dl = toAbsoluteUrl(f.src.download || f.src.view);
+      const h = parseInt(f.name, 10);
+      return {
+        quality: f.name,
+        height: Number.isFinite(h) ? h : f.name === 'Source' ? 9999 : 0,
+        url: dl,
+        isHls: false,
+      };
+    })
+    .filter((f) => f.url && f.quality !== 'preview');
+
+  if (!formats.length) throw new Error('ダウンロード可能なURLがありません');
+
+  return {
+    title: meta.title || id,
+    formats,
+    site: 'iwara',
+  };
+}
+
+// ========== 共通 ==========
+async function extractAny(url) {
+  if (isIwaraUrl(url)) return extractIwara(url);
+  if (isPornhubUrl(url)) return extractPornhub(url);
+  throw new Error('対応サイトは pornhub.com / jp.pornhub.com / iwara.tv です');
+}
 
 // 情報取得
 app.post('/api/info', checkKey, async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: 'URLを入力してください' });
-  if (!isPornhubUrl(url)) {
-    return res.status(400).json({ error: '有効なPornHubのURLを入力してください' });
-  }
 
   try {
-    const data = await extractFormats(url);
+    const data = await extractAny(url);
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: err.message || '情報取得に失敗しました' });
   }
 });
 
-// ダウンロード準備（変換してトークン発行）
+// ダウンロード
 app.post('/api/download', checkKey, async (req, res) => {
   const { url, quality } = req.body || {};
   if (!url) return res.status(400).json({ error: 'URLを入力してください' });
-  if (!isPornhubUrl(url)) {
-    return res.status(400).json({ error: '有効なPornHubのURLを入力してください' });
-  }
+
+  let tempDir = null;
 
   try {
-    const { token, filename } = await prepareDownloadFile(url, quality);
-    res.json({
-      ok: true,
-      token,
-      filename,
-      downloadUrl: `/api/file/${token}`,
-      playUrl: `/api/play/${token}`,
-      expiresInSec: Math.floor(TEMP_TTL_MS / 1000),
+    const { title, formats, site } = await extractAny(url);
+
+    let selected = formats[0];
+    if (quality) {
+      const found = formats.find(
+        (f) => String(f.quality) === String(quality) || String(f.height) === String(quality)
+      );
+      if (found) selected = found;
+    }
+
+    const safeTitle = String(title)
+      .replace(/[\\/:*?"<>|]/g, '_')
+      .slice(0, 80);
+    const filename = `${safeTitle}_${selected.quality || selected.height}p.mp4`;
+
+    // Iwara / 通常MP4 → そのまま配信
+    if (!selected.isHls) {
+      const videoRes = await fetch(selected.url, {
+        headers: getHeaders(url),
+        timeout: 60000,
+      });
+      if (!videoRes.ok) throw new Error(`動画取得失敗: ${videoRes.status}`);
+
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`
+      );
+      videoRes.body.pipe(res);
+      return;
+    }
+
+    // Pornhub HLS → セグメント取得 → ffmpeg
+    tempDir = makeTempDir();
+    const outputPath = path.join(tempDir, 'output.mp4');
+
+    console.log(`[${site}] HLS変換開始`);
+    const segmentUrls = await getSegmentUrls(selected.url, url);
+    console.log(`セグメント数: ${segmentUrls.length}`);
+    const localFiles = await downloadSegments(segmentUrls, tempDir, url);
+    await convertLocalTsToMp4(localFiles, outputPath);
+
+    const stat = fs.statSync(outputPath);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`
+    );
+
+    const stream = fs.createReadStream(outputPath);
+    stream.pipe(res);
+    stream.on('close', () => removeDir(tempDir));
+    stream.on('error', () => {
+      removeDir(tempDir);
+      if (!res.headersSent) res.status(500).end();
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message || 'ダウンロードに失敗しました' });
+    if (tempDir) removeDir(tempDir);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message || 'ダウンロードに失敗しました' });
+    }
   }
 });
 
-// 実際のファイル配信（保存用）
-app.get('/api/file/:token', (req, res) => {
-  cleanupExpiredFiles();
-
-  const info = tempFiles.get(req.params.token);
-  if (!info || !fs.existsSync(info.path)) {
-    return res.status(404).send('ファイルが見つかりません（期限切れの可能性があります）');
-  }
-
-  const stat = fs.statSync(info.path);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Length', stat.size);
-  res.setHeader(
-    'Content-Disposition',
-    `attachment; filename*=UTF-8''${encodeURIComponent(info.filename)}`
-  );
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Cache-Control', 'no-store');
-
-  fs.createReadStream(info.path).pipe(res);
-});
-
-// 再生用（inline）
-app.get('/api/play/:token', (req, res) => {
-  cleanupExpiredFiles();
-
-  const info = tempFiles.get(req.params.token);
-  if (!info || !fs.existsSync(info.path)) {
-    return res.status(404).send('ファイルが見つかりません（期限切れの可能性があります）');
-  }
-
-  const stat = fs.statSync(info.path);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Length', stat.size);
-  res.setHeader(
-    'Content-Disposition',
-    `inline; filename*=UTF-8''${encodeURIComponent(info.filename)}`
-  );
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Cache-Control', 'no-store');
-
-  fs.createReadStream(info.path).pipe(res);
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, () => {
