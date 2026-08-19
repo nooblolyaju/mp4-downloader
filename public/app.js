@@ -2,12 +2,13 @@ const urlInput = document.getElementById('url');
 const keyInput = document.getElementById('key');
 const infoBtn = document.getElementById('infoBtn');
 const dlBtn = document.getElementById('dlBtn');
+const proxyBtn = document.getElementById('proxyBtn');
 const statusEl = document.getElementById('status');
 const formatsEl = document.getElementById('formats');
 
-keyInput.value = localStorage.getItem('ph_api_key') || '';
+keyInput.value = localStorage.getItem('vdl_api_key') || '';
 keyInput.addEventListener('change', () => {
-  localStorage.setItem('ph_api_key', keyInput.value);
+  localStorage.setItem('vdl_api_key', keyInput.value);
 });
 
 function setStatus(msg, type = '') {
@@ -16,12 +17,10 @@ function setStatus(msg, type = '') {
 }
 
 function isIOS() {
-  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-}
-
-function isLineBrowser() {
-  return /Line\//i.test(navigator.userAgent);
+  return (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  );
 }
 
 infoBtn.addEventListener('click', async () => {
@@ -45,27 +44,28 @@ infoBtn.addEventListener('click', async () => {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '失敗しました');
 
-    const formats = (data.formats || []).filter(f => Number(f.height) > 0);
-    setStatus(`タイトル: ${data.title}`, 'ok');
+    const formats = (data.formats || []).filter(
+      (f) => f.quality && f.quality !== 'preview'
+    );
+
+    setStatus(`タイトル: ${data.title}（${data.site || 'unknown'}）`, 'ok');
 
     if (!formats.length) {
-      formatsEl.innerHTML = '<span style="color:#f44336">利用可能な画質がありません</span>';
+      formatsEl.innerHTML =
+        '<span style="color:#f44336">利用可能な画質がありません</span>';
       return;
     }
 
-    let html = '';
-    if (data.thumbnail) {
-      html += `
-        <div style="margin-bottom:14px;">
-          <img src="${data.thumbnail}" alt="thumbnail"
-               style="max-width:100%; border-radius:8px; border:1px solid #333; display:block;">
-        </div>
-      `;
-    }
-
-    html += '<strong>利用可能な画質:</strong><br>';
-    html += formats.map(f => `${f.quality}p （${f.isHls ? 'HLS → MP4変換' : 'MP4'}）`).join('<br>');
-    html += '<br><br><span style="color:#4caf50">※ HLSはサーバーで本物のMP4に変換してからダウンロードします</span>';
+    let html = '<strong>利用可能な画質:</strong><br>';
+    html += formats
+      .map((f) => {
+        const label = f.isHls ? 'HLS→MP4変換' : 'MP4';
+        const q = f.quality;
+        const suffix =
+          typeof q === 'number' || /^\d+$/.test(String(q)) ? 'p' : '';
+        return `${q}${suffix} （${label}）`;
+      })
+      .join('<br>');
 
     formatsEl.innerHTML = html;
   } catch (err) {
@@ -80,9 +80,8 @@ dlBtn.addEventListener('click', async () => {
   const key = keyInput.value.trim();
   if (!url || !key) return setStatus('URLとAPIキーを入力してください', 'error');
 
-  setStatus('変換中です...（1〜3分かかることがあります）');
+  setStatus('準備中...（HLSの場合は変換に時間がかかります）');
   dlBtn.disabled = true;
-  formatsEl.innerHTML = '';
 
   try {
     const res = await fetch('/api/download', {
@@ -94,62 +93,72 @@ dlBtn.addEventListener('click', async () => {
       body: JSON.stringify({ url }),
     });
 
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `エラー ${res.status}`);
-
-    const downloadUrl = data.downloadUrl;
-    const playUrl = data.token ? `/api/play/${data.token}` : null;
-    const filename = data.filename || 'video.mp4';
-
-    // LINE / iPhone向け：直リンクを表示
-    let html = `
-      <div style="margin-top:12px; padding:14px; background:#222; border-radius:10px; border:1px solid #444;">
-        <div style="margin-bottom:10px; color:#4caf50; font-weight:bold;">変換完了: ${filename}</div>
-        <div style="display:flex; flex-direction:column; gap:10px;">
-          <a href="${downloadUrl}" 
-             style="display:block; text-align:center; padding:12px; background:#ff9000; color:#000; border-radius:8px; font-weight:bold; text-decoration:none;">
-            📥 ダウンロード（保存）
-          </a>
-    `;
-
-    if (playUrl) {
-      html += `
-          <a href="${playUrl}" target="_blank" rel="noopener"
-             style="display:block; text-align:center; padding:12px; background:#333; color:#fff; border-radius:8px; font-weight:bold; text-decoration:none;">
-            ▶️ 再生する
-          </a>
-      `;
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `エラー ${res.status}`);
     }
 
-    html += `
-        </div>
-        <div style="margin-top:12px; font-size:0.85rem; color:#aaa; line-height:1.5;">
-          【LINEの場合】<br>
-          1. 「ダウンロード」をタップ<br>
-          2. 右上メニュー → 「ブラウザで開く」が出たらそれを使うと保存しやすいです<br>
-          3. または長押しして「リンクを保存」/「ファイルに保存」
-        </div>
-        <div style="margin-top:8px; font-size:0.8rem; color:#888;">
-          ※ リンクの有効期限は約15分です
-        </div>
-      </div>
-    `;
+    const blob = await res.blob();
+    const disp = res.headers.get('Content-Disposition') || '';
+    const match = disp.match(/filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i);
+    let filename = 'video.mp4';
+    if (match) filename = decodeURIComponent(match[1] || match[2] || 'video.mp4');
 
-    formatsEl.innerHTML = html;
-    setStatus('変換完了。下のボタンから保存または再生してください', 'ok');
+    const blobUrl = URL.createObjectURL(blob);
 
-    // PCなどでは自動でダウンロードも試す
-    if (!isLineBrowser() && !isIOS()) {
+    if (isIOS()) {
+      setStatus(
+        '新しいタブで開きます。長押しして「ファイルに保存」を選んでください',
+        'ok'
+      );
+      setTimeout(() => {
+        const opened = window.open(blobUrl, '_blank');
+        if (!opened) {
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.target = '_blank';
+          a.click();
+        }
+      }, 150);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
+    } else {
       const a = document.createElement('a');
-      a.href = downloadUrl;
+      a.href = blobUrl;
       a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
+      URL.revokeObjectURL(blobUrl);
+      setStatus('ダウンロードを開始しました', 'ok');
     }
   } catch (err) {
     setStatus(err.message, 'error');
   } finally {
     dlBtn.disabled = false;
+  }
+});
+
+// プロキシ確認（iPhone向け）
+proxyBtn.addEventListener('click', async () => {
+  const key = keyInput.value.trim();
+  if (!key) return setStatus('APIキーを入力してください', 'error');
+
+  setStatus('プロキシ確認中...');
+  proxyBtn.disabled = true;
+
+  try {
+    const res = await fetch('/api/proxy-check', {
+      headers: { 'x-api-key': key },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '確認に失敗しました');
+
+    const onOff = data.proxyEnabled ? 'ON' : 'OFF';
+    const ip = data.outboundIp || '不明';
+    setStatus(`プロキシ: ${onOff} / 出口IP: ${ip}`, 'ok');
+  } catch (err) {
+    setStatus(err.message, 'error');
+  } finally {
+    proxyBtn.disabled = false;
   }
 });
