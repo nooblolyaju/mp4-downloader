@@ -1,3 +1,7 @@
+const { HttpsProxyAgent } = require('https-proxy-agent');
+
+const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
+const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
