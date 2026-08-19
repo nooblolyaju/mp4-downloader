@@ -1,7 +1,3 @@
-const { HttpsProxyAgent } = require('https-proxy-agent');
-
-const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
-const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -10,13 +6,33 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const fetch = require('node-fetch');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const ffmpegPath = require('ffmpeg-static');
 
 const app = express();
 const PORT = process.env.PORT || 3456;
 const API_KEY = process.env.API_KEY || 'your-secret-key-here';
 
-// Iwara の X-Version 用ソルト（2026年現在）
+// Webshare などのプロキシ（Render の Environment で設定）
+// 例: http://user:pass@142.111.67.146:5611
+const PROXY_URL = (process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '').trim();
+const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
+
+if (proxyAgent) {
+  console.log('Proxy enabled:', PROXY_URL.replace(/:\/\/[^:]+:[^@]+@/, '://***:***@'));
+} else {
+  console.log('Proxy disabled (HTTPS_PROXY not set)');
+}
+
+// 共通 fetch（プロキシがあれば自動で使う）
+function proxyFetch(url, options = {}) {
+  const opts = { ...options };
+  if (proxyAgent) {
+    opts.agent = proxyAgent;
+  }
+  return fetch(url, opts);
+}
+
 const IWARA_XVERSION_SALT = 'mSvL05GfEmeEmsEYfGCnVpEjYgTJraJN';
 
 app.use(cors());
@@ -51,7 +67,6 @@ function removeDir(dir) {
   } catch (_) {}
 }
 
-// ========== ドメイン判定 ==========
 function isPornhubUrl(url) {
   try {
     return /(?:^|\.)pornhub\.com$/i.test(new URL(url).hostname);
@@ -68,7 +83,6 @@ function isIwaraUrl(url) {
   }
 }
 
-// ========== Pornhub ==========
 function getViewkey(url) {
   try {
     return new URL(url).searchParams.get('viewkey');
@@ -77,11 +91,12 @@ function getViewkey(url) {
   }
 }
 
+// ========== Pornhub ==========
 async function extractPornhub(pageUrl) {
   const viewkey = getViewkey(pageUrl);
   if (!viewkey) throw new Error('viewkey が見つかりません');
 
-  const res = await fetch(pageUrl, {
+  const res = await proxyFetch(pageUrl, {
     headers: getHeaders(pageUrl),
     redirect: 'follow',
     timeout: 25000,
@@ -116,7 +131,7 @@ async function extractPornhub(pageUrl) {
 
   if (!mediaDefinitions) {
     try {
-      const apiRes = await fetch('https://www.pornhub.com/video/get_media_definitions_v2', {
+      const apiRes = await proxyFetch('https://www.pornhub.com/video/get_media_definitions_v2', {
         method: 'POST',
         headers: {
           ...getHeaders(pageUrl),
@@ -178,7 +193,7 @@ async function extractPornhub(pageUrl) {
 }
 
 async function getSegmentUrls(m3u8Url, referer) {
-  const res = await fetch(m3u8Url, { headers: getHeaders(referer) });
+  const res = await proxyFetch(m3u8Url, { headers: getHeaders(referer) });
   if (!res.ok) throw new Error('m3u8の取得に失敗しました');
   const text = await res.text();
 
@@ -215,7 +230,7 @@ async function downloadSegments(segmentUrls, tempDir, referer) {
   const localFiles = [];
   for (let i = 0; i < segmentUrls.length; i++) {
     const localPath = path.join(tempDir, `seg_${String(i).padStart(5, '0')}.ts`);
-    const res = await fetch(segmentUrls[i], { headers: getHeaders(referer) });
+    const res = await proxyFetch(segmentUrls[i], { headers: getHeaders(referer) });
     if (!res.ok) continue;
     fs.writeFileSync(localPath, await res.buffer());
     localFiles.push(localPath);
@@ -289,20 +304,20 @@ async function extractIwara(pageUrl) {
   const id = getIwaraVideoId(pageUrl);
   if (!id) throw new Error('Iwaraの動画IDを取得できませんでした');
 
-  const metaRes = await fetch(`https://api.iwara.tv/video/${id}`, {
+  const metaRes = await proxyFetch(`https://api.iwara.tv/video/${id}`, {
     headers: {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       Accept: 'application/json',
     },
-    timeout: 20000,
+    timeout: 25000,
   });
 
   const text = await metaRes.text();
   if (!metaRes.ok) {
-    if (text.includes('Just a moment') || text.includes('cf-mitigated')) {
+    if (text.includes('Just a moment') || text.includes('cf-mitigated') || text.includes('Cloudflare')) {
       throw new Error(
-        'Cloudflareにブロックされました。Renderからapi.iwara.tvへのアクセスが制限されている可能性があります'
+        'Cloudflareにブロックされました。プロキシを確認するか、別のプロキシを試してください'
       );
     }
     throw new Error(`Iwara APIエラー: ${metaRes.status}`);
@@ -331,14 +346,14 @@ async function extractIwara(pageUrl) {
   }
 
   const xVersion = makeIwaraXVersion(meta.fileUrl);
-  const filesRes = await fetch(meta.fileUrl, {
+  const filesRes = await proxyFetch(meta.fileUrl, {
     headers: {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       Accept: 'application/json',
       'X-Version': xVersion,
     },
-    timeout: 20000,
+    timeout: 25000,
   });
 
   if (!filesRes.ok) {
@@ -376,14 +391,31 @@ async function extractIwara(pageUrl) {
   };
 }
 
-// ========== 共通 ==========
 async function extractAny(url) {
   if (isIwaraUrl(url)) return extractIwara(url);
   if (isPornhubUrl(url)) return extractPornhub(url);
   throw new Error('対応サイトは pornhub.com / jp.pornhub.com / iwara.tv です');
 }
 
-// 情報取得
+// プロキシ動作確認用（任意）
+app.get('/api/proxy-check', checkKey, async (req, res) => {
+  try {
+    const r = await proxyFetch('https://api.ipify.org?format=json', { timeout: 15000 });
+    const data = await r.json();
+    res.json({
+      ok: true,
+      proxyEnabled: Boolean(proxyAgent),
+      outboundIp: data.ip,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      proxyEnabled: Boolean(proxyAgent),
+      error: err.message,
+    });
+  }
+});
+
 app.post('/api/info', checkKey, async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: 'URLを入力してください' });
@@ -397,7 +429,6 @@ app.post('/api/info', checkKey, async (req, res) => {
   }
 });
 
-// ダウンロード
 app.post('/api/download', checkKey, async (req, res) => {
   const { url, quality } = req.body || {};
   if (!url) return res.status(400).json({ error: 'URLを入力してください' });
@@ -420,11 +451,10 @@ app.post('/api/download', checkKey, async (req, res) => {
       .slice(0, 80);
     const filename = `${safeTitle}_${selected.quality || selected.height}p.mp4`;
 
-    // Iwara / 通常MP4 → そのまま配信
     if (!selected.isHls) {
-      const videoRes = await fetch(selected.url, {
+      const videoRes = await proxyFetch(selected.url, {
         headers: getHeaders(url),
-        timeout: 60000,
+        timeout: 120000,
       });
       if (!videoRes.ok) throw new Error(`動画取得失敗: ${videoRes.status}`);
 
@@ -437,7 +467,6 @@ app.post('/api/download', checkKey, async (req, res) => {
       return;
     }
 
-    // Pornhub HLS → セグメント取得 → ffmpeg
     tempDir = makeTempDir();
     const outputPath = path.join(tempDir, 'output.mp4');
 
