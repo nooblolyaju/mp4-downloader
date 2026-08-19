@@ -3,33 +3,43 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PornHub Downloader</title>
+  <title>Video Downloader</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <div class="container">
-    <h1>PornHub Downloader</h1>
-    <p class="subtitle">www / jp 両対応・どのブラウザでも使えます</p>
+    <h1>Video Downloader</h1>
+    <p class="subtitle">PornHub / Iwara 対応・どのブラウザでもOK</p>
 
     <div class="card">
       <label for="url">動画ページのURL</label>
-      <input type="url" id="url" placeholder="https://jp.pornhub.com/view_video.php?viewkey=..." />
+      <input
+        type="url"
+        id="url"
+        placeholder="https://www.pornhub.com/... または https://www.iwara.tv/video/..."
+      />
 
       <label for="key">APIキー</label>
       <input type="password" id="key" placeholder="自分で設定したキー" />
 
       <div class="row">
-        <button id="infoBtn">情報を取得</button>
-        <button id="dlBtn" class="primary">ダウンロード</button>
+        <button id="infoBtn" type="button">情報を取得</button>
+        <button id="dlBtn" class="primary" type="button">ダウンロード</button>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <button id="proxyBtn" type="button">プロキシ確認</button>
       </div>
 
       <div id="status" class="status"></div>
       <div id="formats" class="formats"></div>
     </div>
 
-    <p class="note">※ 自分のサーバーで動作しています。利用は自己責任でお願いします。</p>
+    <p class="note">
+      対応: www.pornhub.com / jp.pornhub.com / www.iwara.tv<br />
+      ※ 利用は自己責任でお願いします
+    </p>
   </div>
-
   <script src="app.js"></script>
 </body>
 </html>
