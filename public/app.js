@@ -26,8 +26,6 @@ function isIOS() {
   );
 }
 
-// ===== Iwara ブックマークレット =====
-// 動画ページ (iwara.tv) 上で実行する
 const BOOKMARKLET = `javascript:(async function(){
   const S='mSvL05GfEmeEmsEYfGCnVpEjYgTJraJN';
   try{
@@ -85,58 +83,42 @@ if (copyBmBtn) {
         bmCodeEl.focus();
         bmCodeEl.select();
       }
-      bmStatus.textContent = 'コピーに失敗したので、下のコードを長押ししてコピーしてください';
+      bmStatus.textContent = 'コピー失敗。下のコードを長押ししてコピーしてください';
       bmStatus.className = 'status error';
     }
   });
 }
 
-// ===== 既存: 情報取得 =====
 infoBtn.addEventListener('click', async () => {
   const url = urlInput.value.trim();
   const key = keyInput.value.trim();
   if (!url || !key) return setStatus('URLとAPIキーを入力してください', 'error');
-
   setStatus('情報を取得中...');
   formatsEl.innerHTML = '';
   infoBtn.disabled = true;
-
   try {
     const res = await fetch('/api/info', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': key,
-      },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key },
       body: JSON.stringify({ url }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '失敗しました');
-
-    const formats = (data.formats || []).filter(
-      (f) => f.quality && f.quality !== 'preview'
-    );
-
+    const formats = (data.formats || []).filter((f) => f.quality && f.quality !== 'preview');
     setStatus(`タイトル: ${data.title}（${data.site || 'unknown'}）`, 'ok');
-
     if (!formats.length) {
-      formatsEl.innerHTML =
-        '<span style="color:#f44336">利用可能な画質がありません</span>';
+      formatsEl.innerHTML = '<span style="color:#f44336">利用可能な画質がありません</span>';
       return;
     }
-
-    let html = '<strong>利用可能な画質:</strong><br>';
-    html += formats
-      .map((f) => {
-        const label = f.isHls ? 'HLS→MP4変換' : 'MP4';
-        const q = f.quality;
-        const suffix =
-          typeof q === 'number' || /^\d+$/.test(String(q)) ? 'p' : '';
-        return `${q}${suffix} （${label}）`;
-      })
-      .join('<br>');
-
-    formatsEl.innerHTML = html;
+    formatsEl.innerHTML =
+      '<strong>利用可能な画質:</strong><br>' +
+      formats
+        .map((f) => {
+          const label = f.isHls ? 'HLS→MP4変換' : 'MP4';
+          const suffix = typeof f.quality === 'number' || /^\d+$/.test(String(f.quality)) ? 'p' : '';
+          return `${f.quality}${suffix} （${label}）`;
+        })
+        .join('<br>');
   } catch (err) {
     setStatus(err.message, 'error');
   } finally {
@@ -144,46 +126,32 @@ infoBtn.addEventListener('click', async () => {
   }
 });
 
-// ===== 既存: ダウンロード =====
 dlBtn.addEventListener('click', async () => {
   const url = urlInput.value.trim();
   const key = keyInput.value.trim();
   if (!url || !key) return setStatus('URLとAPIキーを入力してください', 'error');
-
-  setStatus('準備中...（HLSの場合は変換に時間がかかります）');
+  setStatus('準備中...');
   dlBtn.disabled = true;
-
   try {
     const res = await fetch('/api/download', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': key,
-      },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key },
       body: JSON.stringify({ url }),
     });
-
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `エラー ${res.status}`);
     }
-
     const blob = await res.blob();
     const disp = res.headers.get('Content-Disposition') || '';
     const match = disp.match(/filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i);
     let filename = 'video.mp4';
     if (match) filename = decodeURIComponent(match[1] || match[2] || 'video.mp4');
-
     const blobUrl = URL.createObjectURL(blob);
-
     if (isIOS()) {
-      setStatus(
-        '新しいタブで開きます。長押しして「ファイルに保存」を選んでください',
-        'ok'
-      );
+      setStatus('新しいタブで開きます。長押しで保存してください', 'ok');
       setTimeout(() => {
-        const opened = window.open(blobUrl, '_blank');
-        if (!opened) {
+        if (!window.open(blobUrl, '_blank')) {
           const a = document.createElement('a');
           a.href = blobUrl;
           a.target = '_blank';
@@ -208,24 +176,19 @@ dlBtn.addEventListener('click', async () => {
   }
 });
 
-// ===== 既存: プロキシ確認 =====
 proxyBtn.addEventListener('click', async () => {
   const key = keyInput.value.trim();
   if (!key) return setStatus('APIキーを入力してください', 'error');
-
   setStatus('プロキシ確認中...');
   proxyBtn.disabled = true;
-
   try {
-    const res = await fetch('/api/proxy-check', {
-      headers: { 'x-api-key': key },
-    });
+    const res = await fetch('/api/proxy-check', { headers: { 'x-api-key': key } });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '確認に失敗しました');
-
-    const onOff = data.proxyEnabled ? 'ON' : 'OFF';
-    const ip = data.outboundIp || '不明';
-    setStatus(`プロキシ: ${onOff} / 出口IP: ${ip}`, 'ok');
+    setStatus(
+      `プロキシ: ${data.proxyEnabled ? 'ON' : 'OFF'} / 出口IP: ${data.outboundIp || '不明'}`,
+      'ok'
+    );
   } catch (err) {
     setStatus(err.message, 'error');
   } finally {
